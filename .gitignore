@@ -1,0 +1,7 @@
+.idea/
+.venv/
+__pycache__/
+downloaded_pages/
+test_download/
+pages_archive.zip
+index.txt
