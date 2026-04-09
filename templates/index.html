@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Векторный поиск</title>
+    <style>
+        :root {
+            --bg: #f3efe6;
+            --card: #fffdf8;
+            --ink: #1f1d1a;
+            --muted: #6b6258;
+            --accent: #9a3412;
+            --line: #ded6ca;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Georgia, "Times New Roman", serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at top left, rgba(154, 52, 18, 0.08), transparent 28%),
+                linear-gradient(180deg, #f8f5ee 0%, var(--bg) 100%);
+        }
+
+        main {
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 48px 20px 64px;
+        }
+
+        .hero {
+            margin-bottom: 28px;
+        }
+
+        h1 {
+            margin: 0 0 12px;
+            font-size: clamp(2.2rem, 5vw, 4rem);
+            line-height: 0.95;
+            letter-spacing: -0.03em;
+        }
+
+        .lead {
+            margin: 0;
+            max-width: 680px;
+            color: var(--muted);
+            font-size: 1.05rem;
+        }
+
+        .panel {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            padding: 22px;
+            box-shadow: 0 12px 30px rgba(31, 29, 26, 0.06);
+        }
+
+        form {
+            display: grid;
+            gap: 14px;
+        }
+
+        label {
+            display: block;
+            font-size: 0.95rem;
+            margin-bottom: 6px;
+        }
+
+        input[type="text"],
+        input[type="number"] {
+            width: 100%;
+            padding: 14px 16px;
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            font: inherit;
+            background: #fff;
+        }
+
+        .controls {
+            display: grid;
+            grid-template-columns: 1fr 180px 160px;
+            gap: 14px;
+            align-items: end;
+        }
+
+        button {
+            padding: 14px 18px;
+            border: 0;
+            border-radius: 12px;
+            background: var(--accent);
+            color: #fff8f4;
+            font: inherit;
+            cursor: pointer;
+        }
+
+        .meta {
+            margin: 18px 0 0;
+            color: var(--muted);
+        }
+
+        .results {
+            margin-top: 28px;
+            display: grid;
+            gap: 14px;
+        }
+
+        .result {
+            display: grid;
+            gap: 8px;
+            background: rgba(255, 253, 248, 0.88);
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            padding: 18px;
+        }
+
+        .score {
+            color: var(--accent);
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            font-size: 0.8rem;
+        }
+
+        .doc {
+            font-size: 1.15rem;
+        }
+
+        a {
+            color: #0f4c5c;
+            word-break: break-all;
+        }
+
+        @media (max-width: 720px) {
+            .controls {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+<main>
+    <section class="hero">
+        <h1>Векторный поиск по документам</h1>
+        <p class="lead">Запрос лемматизируется, превращается в TF-IDF-вектор и сравнивается с документами по косинусному сходству.</p>
+    </section>
+
+    <section class="panel">
+        <form method="get">
+            <div>
+                <label for="q">Поисковый запрос</label>
+                <input id="q" name="q" type="text" value="{{ query }}" placeholder="Например: москва столица река">
+            </div>
+
+            <div class="controls">
+                <div>
+                    <label for="top_k">Сколько результатов показать</label>
+                    <input id="top_k" name="top_k" type="number" min="1" max="50" value="{{ top_k }}">
+                </div>
+                <div></div>
+                <button type="submit">Искать</button>
+            </div>
+        </form>
+
+        {% if query %}
+            <p class="meta">Найдено результатов: {{ results|length }}</p>
+        {% endif %}
+    </section>
+
+    {% if results %}
+        <section class="results">
+            {% for result in results %}
+                <article class="result">
+                    <div class="score">score {{ result.score }}</div>
+                    <div class="doc">{{ result.document }}</div>
+                    <a href="{{ result.url }}" target="_blank" rel="noreferrer">{{ result.url }}</a>
+                </article>
+            {% endfor %}
+        </section>
+    {% elif query %}
+        <section class="results">
+            <article class="result">
+                <div class="doc">По запросу ничего не найдено.</div>
+            </article>
+        </section>
+    {% endif %}
+</main>
+</body>
+</html>
