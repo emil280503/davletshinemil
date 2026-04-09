@@ -4,10 +4,12 @@ import argparse
 import concurrent.futures
 import html
 import http.client
+import math
 import pathlib
 import re
 import shutil
 import time
+from collections import Counter
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib import error, parse, request
@@ -21,6 +23,8 @@ DEFAULT_INDEX_FILE = pathlib.Path("index.txt")
 DEFAULT_TOKENS_FILE = pathlib.Path("tokens.txt")
 DEFAULT_LEMMAS_FILE = pathlib.Path("lemmas.txt")
 DEFAULT_INVERTED_INDEX_FILE = pathlib.Path("inverted_index.txt")
+DEFAULT_TERM_TFIDF_DIR = pathlib.Path("term_tfidf")
+DEFAULT_LEMMA_TFIDF_DIR = pathlib.Path("lemma_tfidf")
 FORBIDDEN_EXTENSIONS = {
     ".jpg",
     ".jpeg",
@@ -166,6 +170,14 @@ class DownloadResult:
     file_name: str
 
 
+@dataclass
+class DocumentStats:
+    name: str
+    term_counts: Counter[str]
+    lemma_counts: Counter[str]
+    total_terms: int
+
+
 class VisibleTextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -193,7 +205,7 @@ class VisibleTextExtractor(HTMLParser):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Скачивает HTML-страницы, строит токены, леммы, инвертированный индекс и выполняет булев поиск."
+        description="Скачивает HTML-страницы, строит индекс, выполняет булев поиск и считает TF-IDF."
     )
     parser.add_argument("--urls", type=pathlib.Path, default=DEFAULT_URLS_FILE)
     parser.add_argument("--output", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
@@ -201,6 +213,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokens", type=pathlib.Path, default=DEFAULT_TOKENS_FILE)
     parser.add_argument("--lemmas", type=pathlib.Path, default=DEFAULT_LEMMAS_FILE)
     parser.add_argument("--inverted-index", type=pathlib.Path, default=DEFAULT_INVERTED_INDEX_FILE)
+    parser.add_argument("--term-tfidf-dir", type=pathlib.Path, default=DEFAULT_TERM_TFIDF_DIR)
+    parser.add_argument("--lemma-tfidf-dir", type=pathlib.Path, default=DEFAULT_LEMMA_TFIDF_DIR)
     parser.add_argument("--timeout", type=float, default=20.0)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--workers", type=int, default=8)
@@ -321,18 +335,44 @@ def normalize_term(token: str) -> str | None:
     return lemma
 
 
+def load_document_urls(index_path: pathlib.Path) -> dict[str, str]:
+    if not index_path.exists():
+        return {}
+
+    document_urls: dict[str, str] = {}
+    for line in index_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", maxsplit=1)
+        if len(parts) == 2:
+            document_urls[parts[0]] = parts[1]
+    return document_urls
+
+
 def collect_corpus_data(
     input_dir: pathlib.Path,
-) -> tuple[list[str], dict[str, list[str]], dict[str, list[str]], dict[str, str]]:
+) -> tuple[
+    list[str],
+    dict[str, list[str]],
+    dict[str, list[str]],
+    dict[str, str],
+    list[DocumentStats],
+    dict[str, float],
+    dict[str, float],
+]:
     unique_tokens: set[str] = set()
     lemma_to_tokens: dict[str, set[str]] = {}
     inverted_index: dict[str, set[str]] = {}
+    term_document_frequency: Counter[str] = Counter()
+    lemma_document_frequency: Counter[str] = Counter()
     doc_to_url = load_document_urls(input_dir / "index.txt")
+    document_stats: list[DocumentStats] = []
 
     for page_path in iter_page_files(input_dir):
         document_name = page_path.name
         visible_text = extract_visible_text(page_path.read_text(encoding="utf-8"))
-        document_terms: set[str] = set()
+        term_counts: Counter[str] = Counter()
+        lemma_counts: Counter[str] = Counter()
 
         for raw_token in TOKEN_PATTERN.findall(visible_text.lower()):
             lemma = normalize_term(raw_token)
@@ -341,24 +381,55 @@ def collect_corpus_data(
 
             unique_tokens.add(raw_token)
             lemma_to_tokens.setdefault(lemma, set()).add(raw_token)
-            document_terms.add(lemma)
+            term_counts[raw_token] += 1
+            lemma_counts[lemma] += 1
 
-        for term in document_terms:
-            inverted_index.setdefault(term, set()).add(document_name)
+        total_terms = sum(term_counts.values())
+        document_stats.append(
+            DocumentStats(
+                name=document_name,
+                term_counts=term_counts,
+                lemma_counts=lemma_counts,
+                total_terms=total_terms,
+            )
+        )
+
+        for term in term_counts:
+            term_document_frequency[term] += 1
+        for lemma in lemma_counts:
+            lemma_document_frequency[lemma] += 1
+            inverted_index.setdefault(lemma, set()).add(document_name)
 
         doc_to_url.setdefault(document_name, "")
 
+    total_documents = len(document_stats)
+    term_idf = {
+        term: math.log(total_documents / frequency)
+        for term, frequency in sorted(term_document_frequency.items(), key=lambda item: item[0])
+    }
+    lemma_idf = {
+        lemma: math.log(total_documents / frequency)
+        for lemma, frequency in sorted(lemma_document_frequency.items(), key=lambda item: item[0])
+    }
     sorted_tokens = sorted(unique_tokens)
     sorted_lemmas = {
         lemma: sorted(tokens)
         for lemma, tokens in sorted(lemma_to_tokens.items(), key=lambda item: item[0])
     }
     sorted_inverted_index = {
-        term: sorted(documents)
-        for term, documents in sorted(inverted_index.items(), key=lambda item: item[0])
+        lemma: sorted(documents)
+        for lemma, documents in sorted(inverted_index.items(), key=lambda item: item[0])
     }
     sorted_doc_to_url = dict(sorted(doc_to_url.items(), key=lambda item: item[0]))
-    return sorted_tokens, sorted_lemmas, sorted_inverted_index, sorted_doc_to_url
+    return (
+        sorted_tokens,
+        sorted_lemmas,
+        sorted_inverted_index,
+        sorted_doc_to_url,
+        sorted(document_stats, key=lambda item: item.name),
+        term_idf,
+        lemma_idf,
+    )
 
 
 def write_tokens(tokens: list[str], output_path: pathlib.Path) -> None:
@@ -375,18 +446,47 @@ def write_inverted_index(inverted_index: dict[str, list[str]], output_path: path
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def load_document_urls(index_path: pathlib.Path) -> dict[str, str]:
-    if not index_path.exists():
-        return {}
+def reset_output_dir(output_dir: pathlib.Path) -> None:
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    document_urls: dict[str, str] = {}
-    for line in index_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t", maxsplit=1)
-        if len(parts) == 2:
-            document_urls[parts[0]] = parts[1]
-    return document_urls
+
+def write_document_tfidf(
+    document_stats: list[DocumentStats],
+    term_idf: dict[str, float],
+    lemma_idf: dict[str, float],
+    term_output_dir: pathlib.Path,
+    lemma_output_dir: pathlib.Path,
+) -> None:
+    reset_output_dir(term_output_dir)
+    reset_output_dir(lemma_output_dir)
+
+    for document in document_stats:
+        if document.total_terms == 0:
+            term_lines: list[str] = []
+            lemma_lines: list[str] = []
+        else:
+            term_lines = []
+            for term in sorted(document.term_counts):
+                tf = document.term_counts[term] / document.total_terms
+                idf = term_idf[term]
+                term_lines.append(f"{term} {idf:.6f} {tf * idf:.6f}")
+
+            lemma_lines = []
+            for lemma in sorted(document.lemma_counts):
+                tf = document.lemma_counts[lemma] / document.total_terms
+                idf = lemma_idf[lemma]
+                lemma_lines.append(f"{lemma} {idf:.6f} {tf * idf:.6f}")
+
+        (term_output_dir / f"{pathlib.Path(document.name).stem}.txt").write_text(
+            "\n".join(term_lines) + ("\n" if term_lines else ""),
+            encoding="utf-8",
+        )
+        (lemma_output_dir / f"{pathlib.Path(document.name).stem}.txt").write_text(
+            "\n".join(lemma_lines) + ("\n" if lemma_lines else ""),
+            encoding="utf-8",
+        )
 
 
 def tokenize_query(query: str) -> list[str]:
@@ -451,8 +551,8 @@ def evaluate_postfix(postfix_tokens: list[str], inverted_index: dict[str, list[s
             left = stack.pop()
             stack.append(left & right if token == "AND" else left | right)
         else:
-            term = normalize_term(token)
-            stack.append(set(inverted_index.get(term, [])) if term else set())
+            lemma = normalize_term(token)
+            stack.append(set(inverted_index.get(lemma, [])) if lemma else set())
 
     if len(stack) != 1:
         raise ValueError("Некорректная структура булевого запроса.")
@@ -521,10 +621,26 @@ def main() -> None:
     if not page_files:
         raise FileNotFoundError(f"В каталоге {args.output} нет HTML-файлов для обработки.")
 
-    tokens, lemma_to_tokens, inverted_index, document_urls = collect_corpus_data(args.output)
+    (
+        tokens,
+        lemma_to_tokens,
+        inverted_index,
+        document_urls,
+        document_stats,
+        term_idf,
+        lemma_idf,
+    ) = collect_corpus_data(args.output)
+
     write_tokens(tokens, args.tokens)
     write_lemmas(lemma_to_tokens, args.lemmas)
     write_inverted_index(inverted_index, args.inverted_index)
+    write_document_tfidf(
+        document_stats=document_stats,
+        term_idf=term_idf,
+        lemma_idf=lemma_idf,
+        term_output_dir=args.term_tfidf_dir,
+        lemma_output_dir=args.lemma_tfidf_dir,
+    )
 
     print(f"Обработано HTML-файлов: {len(page_files)}")
     print(f"Токенов: {len(tokens)}")
@@ -533,6 +649,8 @@ def main() -> None:
     print(f"Файл токенов: {args.tokens.resolve()}")
     print(f"Файл лемм: {args.lemmas.resolve()}")
     print(f"Файл инвертированного индекса: {args.inverted_index.resolve()}")
+    print(f"Каталог TF-IDF по терминам: {args.term_tfidf_dir.resolve()}")
+    print(f"Каталог TF-IDF по леммам: {args.lemma_tfidf_dir.resolve()}")
 
     if args.query:
         results = run_boolean_search(args.query, inverted_index, document_urls)
