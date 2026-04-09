@@ -1,26 +1,19 @@
 from __future__ import annotations
 
 import argparse
-import collections
+import concurrent.futures
+import http.client
 import pathlib
-import re
+import shutil
 import time
 from dataclasses import dataclass
-from html.parser import HTMLParser
-from typing import Iterable
 from urllib import error, parse, request
 
 
-DEFAULT_SEEDS = [
-    "https://ru.wikipedia.org/wiki/Россия",
-    "https://ru.wikipedia.org/wiki/Москва",
-    "https://ru.wikipedia.org/wiki/Санкт-Петербург",
-    "https://ru.wikipedia.org/wiki/Литература",
-    "https://ru.wikipedia.org/wiki/Наука",
-]
-
-DEFAULT_ALLOWED_DOMAINS = ["ru.wikipedia.org"]
-DEFAULT_FORBIDDEN_EXTENSIONS = {
+DEFAULT_URLS_FILE = pathlib.Path("urls.txt")
+DEFAULT_OUTPUT_DIR = pathlib.Path("downloaded_pages")
+DEFAULT_INDEX_FILE = pathlib.Path("index.txt")
+FORBIDDEN_EXTENSIONS = {
     ".jpg",
     ".jpeg",
     ".png",
@@ -47,177 +40,174 @@ DEFAULT_FORBIDDEN_EXTENSIONS = {
 
 
 @dataclass
-class CrawlResult:
+class DownloadResult:
     url: str
     file_name: str
 
 
-class LinkExtractor(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.links: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() != "a":
-            return
-        for attr_name, attr_value in attrs:
-            if attr_name.lower() == "href" and attr_value:
-                self.links.append(attr_value)
-
-
-class WebCrawler:
-    def __init__(
-        self,
-        seeds: Iterable[str],
-        output_dir: pathlib.Path,
-        limit: int,
-        allowed_domains: Iterable[str],
-        delay: float,
-        timeout: float,
-    ) -> None:
-        self.queue = collections.deque(seeds)
-        self.output_dir = output_dir
-        self.limit = limit
-        self.allowed_domains = {domain.lower() for domain in allowed_domains}
-        self.delay = delay
-        self.timeout = timeout
-        self.visited: set[str] = set()
-        self.saved: list[CrawlResult] = []
-
-        self.opener = request.build_opener()
-        self.opener.addheaders = [
-            (
-                "User-Agent",
-                "Mozilla/5.0 (compatible; PythonProject2Crawler/1.0; +https://example.com/bot)",
-            )
-        ]
-
-    def crawl(self) -> list[CrawlResult]:
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        while self.queue and len(self.saved) < self.limit:
-            current_url = self.queue.popleft()
-            normalized_url = self.normalize_url(current_url)
-            if not normalized_url or normalized_url in self.visited:
-                continue
-
-            self.visited.add(normalized_url)
-            try:
-                html = self.fetch_html(normalized_url)
-            except (error.URLError, error.HTTPError, TimeoutError, ValueError):
-                continue
-
-            file_name = f"{len(self.saved) + 1:03}.html"
-            (self.output_dir / file_name).write_text(html, encoding="utf-8")
-            self.saved.append(CrawlResult(url=normalized_url, file_name=file_name))
-
-            for link in self.extract_links(html, normalized_url):
-                if link not in self.visited:
-                    self.queue.append(link)
-
-            if self.delay > 0:
-                time.sleep(self.delay)
-
-        self.write_index()
-        return self.saved
-
-    def fetch_html(self, url: str) -> str:
-        with self.opener.open(url, timeout=self.timeout) as response:
-            content_type = response.headers.get_content_type()
-            if content_type != "text/html":
-                raise ValueError(f"Unsupported content type: {content_type}")
-
-            raw_data = response.read()
-            charset = response.headers.get_content_charset() or "utf-8"
-            return raw_data.decode(charset, errors="replace")
-
-    def extract_links(self, html: str, base_url: str) -> list[str]:
-        parser = LinkExtractor()
-        parser.feed(html)
-        normalized_links: list[str] = []
-        for link in parser.links:
-            normalized = self.normalize_url(parse.urljoin(base_url, link))
-            if normalized:
-                normalized_links.append(normalized)
-        return normalized_links
-
-    def normalize_url(self, url: str) -> str | None:
-        parsed = parse.urlparse(url)
-        if parsed.scheme not in {"http", "https"}:
-            return None
-
-        domain = parsed.netloc.lower()
-        if self.allowed_domains and domain not in self.allowed_domains:
-            return None
-
-        if any(parsed.path.lower().endswith(ext) for ext in DEFAULT_FORBIDDEN_EXTENSIONS):
-            return None
-
-        if re.search(r":(?!//)", parsed.path):
-            return None
-
-        encoded_path = parse.quote(parse.unquote(parsed.path), safe="/:@")
-        cleaned = parsed._replace(path=encoded_path, fragment="", query="")
-        return parse.urlunparse(cleaned)
-
-    def write_index(self) -> None:
-        index_path = self.output_dir / "index.txt"
-        lines = [f"{result.file_name}\t{result.url}" for result in self.saved]
-        index_path.write_text("\n".join(lines), encoding="utf-8")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Скачивает HTML-страницы и сохраняет их вместе с index.txt."
+        description="Скачивает HTML-страницы из заранее подготовленного списка URL."
     )
     parser.add_argument(
-        "--limit",
-        type=int,
-        default=100,
-        help="Сколько HTML-страниц сохранить. По умолчанию: 100.",
+        "--urls",
+        type=pathlib.Path,
+        default=DEFAULT_URLS_FILE,
+        help="Путь к файлу со списком URL, по одному адресу в строке.",
     )
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=pathlib.Path("downloaded_pages"),
-        help="Каталог для сохранения страниц и index.txt.",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Каталог для сохранения HTML-файлов.",
     )
     parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.2,
-        help="Задержка между запросами в секундах.",
+        "--index",
+        type=pathlib.Path,
+        default=DEFAULT_INDEX_FILE,
+        help="Файл индекса в формате 'номер файла TAB ссылка'.",
     )
     parser.add_argument(
         "--timeout",
         type=float,
-        default=15.0,
+        default=20.0,
         help="Таймаут одного HTTP-запроса в секундах.",
     )
     parser.add_argument(
-        "--seed",
-        action="append",
-        dest="seeds",
-        help="Стартовый URL. Можно передавать несколько раз.",
+        "--retries",
+        type=int,
+        default=2,
+        help="Сколько раз повторять скачивание одной страницы при временной ошибке.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Количество параллельных загрузок.",
     )
     return parser.parse_args()
 
 
+def normalize_url(url: str) -> str | None:
+    stripped = url.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+
+    parsed = parse.urlparse(stripped)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+
+    if any(parsed.path.lower().endswith(ext) for ext in FORBIDDEN_EXTENSIONS):
+        return None
+
+    encoded_path = parse.quote(parse.unquote(parsed.path), safe="/:@")
+    cleaned = parsed._replace(path=encoded_path, fragment="")
+    return parse.urlunparse(cleaned)
+
+
+def load_urls(urls_file: pathlib.Path) -> list[str]:
+    seen: set[str] = set()
+    urls: list[str] = []
+
+    for line in urls_file.read_text(encoding="utf-8").splitlines():
+        normalized = normalize_url(line)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            urls.append(normalized)
+
+    if len(urls) < 100:
+        raise ValueError(f"В файле {urls_file} найдено меньше 100 корректных URL: {len(urls)}")
+
+    return urls
+
+
+def fetch_html(
+    url: str,
+    timeout: float,
+    retries: int,
+) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            opener = request.build_opener()
+            opener.addheaders = [
+                (
+                    "User-Agent",
+                    "Mozilla/5.0 (compatible; PythonProject2Crawler/2.0; +https://example.com/bot)",
+                )
+            ]
+            with opener.open(url, timeout=timeout) as response:
+                content_type = response.headers.get_content_type()
+                if content_type != "text/html":
+                    raise ValueError(f"Unsupported content type: {content_type}")
+
+                raw_data = response.read()
+                charset = response.headers.get_content_charset() or "utf-8"
+                return raw_data.decode(charset, errors="replace")
+        except (
+            error.URLError,
+            error.HTTPError,
+            TimeoutError,
+            ValueError,
+            ConnectionError,
+            http.client.HTTPException,
+        ) as exc:
+            last_error = exc
+            if attempt == retries:
+                break
+            time.sleep(1)
+
+    assert last_error is not None
+    raise last_error
+
+
+def write_index(results: list[DownloadResult], index_path: pathlib.Path) -> None:
+    lines = [f"{result.file_name}\t{result.url}" for result in results]
+    index_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     args = parse_args()
-    seeds = args.seeds or DEFAULT_SEEDS
+    urls = load_urls(args.urls)
 
-    crawler = WebCrawler(
-        seeds=seeds,
-        output_dir=args.output,
-        limit=args.limit,
-        allowed_domains=DEFAULT_ALLOWED_DOMAINS,
-        delay=args.delay,
-        timeout=args.timeout,
-    )
-    results = crawler.crawl()
+    if args.output.exists():
+        shutil.rmtree(args.output)
+    args.output.mkdir(parents=True, exist_ok=True)
+
+    downloaded_html: dict[int, str] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(fetch_html, url, args.timeout, args.retries): (position, url)
+            for position, url in enumerate(urls)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            position, _ = futures[future]
+            try:
+                downloaded_html[position] = future.result()
+            except Exception:
+                continue
+
+    results: list[DownloadResult] = []
+    for position, url in enumerate(urls):
+        html = downloaded_html.get(position)
+        if html is None:
+            continue
+
+        file_name = f"{len(results) + 1:03}.html"
+        (args.output / file_name).write_text(html, encoding="utf-8")
+        results.append(DownloadResult(url=url, file_name=file_name))
+        if len(results) >= 100:
+            break
+
+    if len(results) < 100:
+        raise RuntimeError(f"Удалось скачать только {len(results)} страниц из {len(urls)} URL.")
+
+    write_index(results, args.output / "index.txt")
+    write_index(results, args.index)
     print(f"Сохранено страниц: {len(results)}")
     print(f"Каталог выгрузки: {args.output.resolve()}")
+    print(f"Файл индекса: {args.index.resolve()}")
 
 
 if __name__ == "__main__":
