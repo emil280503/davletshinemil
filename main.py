@@ -20,6 +20,7 @@ DEFAULT_OUTPUT_DIR = pathlib.Path("downloaded_pages")
 DEFAULT_INDEX_FILE = pathlib.Path("index.txt")
 DEFAULT_TOKENS_FILE = pathlib.Path("tokens.txt")
 DEFAULT_LEMMAS_FILE = pathlib.Path("lemmas.txt")
+DEFAULT_INVERTED_INDEX_FILE = pathlib.Path("inverted_index.txt")
 FORBIDDEN_EXTENSIONS = {
     ".jpg",
     ".jpeg",
@@ -45,8 +46,10 @@ FORBIDDEN_EXTENSIONS = {
     ".pptx",
 }
 TOKEN_PATTERN = re.compile(r"[а-яё]+(?:-[а-яё]+)*", re.IGNORECASE)
+QUERY_TOKEN_PATTERN = re.compile(r"\(|\)|AND|OR|NOT|[а-яё]+(?:-[а-яё]+)*", re.IGNORECASE)
 IGNORED_TAGS = {"script", "style", "noscript", "svg"}
 EXCLUDED_POS = {"CONJ", "PREP", "PRCL", "INTJ"}
+OPERATOR_PRIORITY = {"NOT": 3, "AND": 2, "OR": 1}
 STOPWORDS = {
     "а",
     "без",
@@ -190,61 +193,19 @@ class VisibleTextExtractor(HTMLParser):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Скачивает HTML-страницы и строит списки токенов и лемм по сохраненным документам."
+        description="Скачивает HTML-страницы, строит токены, леммы, инвертированный индекс и выполняет булев поиск."
     )
-    parser.add_argument(
-        "--urls",
-        type=pathlib.Path,
-        default=DEFAULT_URLS_FILE,
-        help="Путь к файлу со списком URL, по одному адресу в строке.",
-    )
-    parser.add_argument(
-        "--output",
-        type=pathlib.Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Каталог для сохранения HTML-файлов.",
-    )
-    parser.add_argument(
-        "--index",
-        type=pathlib.Path,
-        default=DEFAULT_INDEX_FILE,
-        help="Файл индекса в формате 'номер файла TAB ссылка'.",
-    )
-    parser.add_argument(
-        "--tokens",
-        type=pathlib.Path,
-        default=DEFAULT_TOKENS_FILE,
-        help="Файл для списка уникальных токенов.",
-    )
-    parser.add_argument(
-        "--lemmas",
-        type=pathlib.Path,
-        default=DEFAULT_LEMMAS_FILE,
-        help="Файл для списка лемм и соответствующих им токенов.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=20.0,
-        help="Таймаут одного HTTP-запроса в секундах.",
-    )
-    parser.add_argument(
-        "--retries",
-        type=int,
-        default=2,
-        help="Сколько раз повторять скачивание одной страницы при временной ошибке.",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=8,
-        help="Количество параллельных загрузок.",
-    )
-    parser.add_argument(
-        "--skip-download",
-        action="store_true",
-        help="Не скачивать страницы заново, а обработать уже сохраненные HTML-файлы.",
-    )
+    parser.add_argument("--urls", type=pathlib.Path, default=DEFAULT_URLS_FILE)
+    parser.add_argument("--output", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--index", type=pathlib.Path, default=DEFAULT_INDEX_FILE)
+    parser.add_argument("--tokens", type=pathlib.Path, default=DEFAULT_TOKENS_FILE)
+    parser.add_argument("--lemmas", type=pathlib.Path, default=DEFAULT_LEMMAS_FILE)
+    parser.add_argument("--inverted-index", type=pathlib.Path, default=DEFAULT_INVERTED_INDEX_FILE)
+    parser.add_argument("--timeout", type=float, default=20.0)
+    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--skip-download", action="store_true")
+    parser.add_argument("--query", type=str, help="Булев запрос с операторами AND, OR, NOT и круглыми скобками.")
     return parser.parse_args()
 
 
@@ -317,7 +278,7 @@ def fetch_html(url: str, timeout: float, retries: int) -> str:
     raise last_error
 
 
-def write_index(results: list[DownloadResult], index_path: pathlib.Path) -> None:
+def write_download_index(results: list[DownloadResult], index_path: pathlib.Path) -> None:
     lines = [f"{result.file_name}\t{result.url}" for result in results]
     index_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -345,41 +306,59 @@ def is_valid_token(token: str) -> bool:
     return True
 
 
-def should_keep_token(token: str) -> tuple[bool, str | None]:
+def normalize_term(token: str) -> str | None:
+    token = token.lower()
     if not is_valid_token(token):
-        return False, None
+        return None
 
     parse_result = MORPH.parse(token)[0]
     if parse_result.tag.POS in EXCLUDED_POS:
-        return False, None
+        return None
 
     lemma = parse_result.normal_form
     if not is_valid_token(lemma):
-        return False, None
+        return None
+    return lemma
 
-    return True, lemma
 
-
-def collect_tokens_and_lemmas(input_dir: pathlib.Path) -> tuple[list[str], dict[str, list[str]]]:
+def collect_corpus_data(
+    input_dir: pathlib.Path,
+) -> tuple[list[str], dict[str, list[str]], dict[str, list[str]], dict[str, str]]:
     unique_tokens: set[str] = set()
     lemma_to_tokens: dict[str, set[str]] = {}
+    inverted_index: dict[str, set[str]] = {}
+    doc_to_url = load_document_urls(input_dir / "index.txt")
 
     for page_path in iter_page_files(input_dir):
+        document_name = page_path.name
         visible_text = extract_visible_text(page_path.read_text(encoding="utf-8"))
+        document_terms: set[str] = set()
+
         for raw_token in TOKEN_PATTERN.findall(visible_text.lower()):
-            keep_token, lemma = should_keep_token(raw_token)
-            if not keep_token or lemma is None:
+            lemma = normalize_term(raw_token)
+            if lemma is None:
                 continue
 
             unique_tokens.add(raw_token)
             lemma_to_tokens.setdefault(lemma, set()).add(raw_token)
+            document_terms.add(lemma)
+
+        for term in document_terms:
+            inverted_index.setdefault(term, set()).add(document_name)
+
+        doc_to_url.setdefault(document_name, "")
 
     sorted_tokens = sorted(unique_tokens)
     sorted_lemmas = {
         lemma: sorted(tokens)
         for lemma, tokens in sorted(lemma_to_tokens.items(), key=lambda item: item[0])
     }
-    return sorted_tokens, sorted_lemmas
+    sorted_inverted_index = {
+        term: sorted(documents)
+        for term, documents in sorted(inverted_index.items(), key=lambda item: item[0])
+    }
+    sorted_doc_to_url = dict(sorted(doc_to_url.items(), key=lambda item: item[0]))
+    return sorted_tokens, sorted_lemmas, sorted_inverted_index, sorted_doc_to_url
 
 
 def write_tokens(tokens: list[str], output_path: pathlib.Path) -> None:
@@ -389,6 +368,105 @@ def write_tokens(tokens: list[str], output_path: pathlib.Path) -> None:
 def write_lemmas(lemma_to_tokens: dict[str, list[str]], output_path: pathlib.Path) -> None:
     lines = [f"{lemma} {' '.join(tokens)}" for lemma, tokens in lemma_to_tokens.items()]
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_inverted_index(inverted_index: dict[str, list[str]], output_path: pathlib.Path) -> None:
+    lines = [f"{term} {' '.join(documents)}" for term, documents in inverted_index.items()]
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def load_document_urls(index_path: pathlib.Path) -> dict[str, str]:
+    if not index_path.exists():
+        return {}
+
+    document_urls: dict[str, str] = {}
+    for line in index_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", maxsplit=1)
+        if len(parts) == 2:
+            document_urls[parts[0]] = parts[1]
+    return document_urls
+
+
+def tokenize_query(query: str) -> list[str]:
+    tokens = QUERY_TOKEN_PATTERN.findall(query)
+    if not tokens:
+        raise ValueError("Пустой или некорректный запрос.")
+    return [token.upper() if token.upper() in OPERATOR_PRIORITY else token for token in tokens]
+
+
+def to_postfix(query_tokens: list[str]) -> list[str]:
+    output: list[str] = []
+    operators: list[str] = []
+
+    for token in query_tokens:
+        if token == "(":
+            operators.append(token)
+        elif token == ")":
+            while operators and operators[-1] != "(":
+                output.append(operators.pop())
+            if not operators:
+                raise ValueError("Несогласованные скобки в запросе.")
+            operators.pop()
+        elif token in OPERATOR_PRIORITY:
+            while (
+                operators
+                and operators[-1] in OPERATOR_PRIORITY
+                and (
+                    OPERATOR_PRIORITY[operators[-1]] > OPERATOR_PRIORITY[token]
+                    or (
+                        OPERATOR_PRIORITY[operators[-1]] == OPERATOR_PRIORITY[token]
+                        and token != "NOT"
+                    )
+                )
+            ):
+                output.append(operators.pop())
+            operators.append(token)
+        else:
+            output.append(token)
+
+    while operators:
+        operator = operators.pop()
+        if operator == "(":
+            raise ValueError("Несогласованные скобки в запросе.")
+        output.append(operator)
+
+    return output
+
+
+def evaluate_postfix(postfix_tokens: list[str], inverted_index: dict[str, list[str]], all_documents: set[str]) -> set[str]:
+    stack: list[set[str]] = []
+
+    for token in postfix_tokens:
+        if token == "NOT":
+            if not stack:
+                raise ValueError("Оператор NOT не имеет аргумента.")
+            operand = stack.pop()
+            stack.append(all_documents - operand)
+        elif token in {"AND", "OR"}:
+            if len(stack) < 2:
+                raise ValueError(f"Оператор {token} не имеет достаточного числа аргументов.")
+            right = stack.pop()
+            left = stack.pop()
+            stack.append(left & right if token == "AND" else left | right)
+        else:
+            term = normalize_term(token)
+            stack.append(set(inverted_index.get(term, [])) if term else set())
+
+    if len(stack) != 1:
+        raise ValueError("Некорректная структура булевого запроса.")
+    return stack[0]
+
+
+def run_boolean_search(
+    query: str,
+    inverted_index: dict[str, list[str]],
+    document_urls: dict[str, str],
+) -> list[tuple[str, str]]:
+    postfix_tokens = to_postfix(tokenize_query(query))
+    matched_documents = evaluate_postfix(postfix_tokens, inverted_index, set(document_urls))
+    return [(document_name, document_urls.get(document_name, "")) for document_name in sorted(matched_documents)]
 
 
 def download_pages(args: argparse.Namespace) -> None:
@@ -427,8 +505,8 @@ def download_pages(args: argparse.Namespace) -> None:
     if len(results) < 100:
         raise RuntimeError(f"Удалось скачать только {len(results)} страниц из {len(urls)} URL.")
 
-    write_index(results, args.output / "index.txt")
-    write_index(results, args.index)
+    write_download_index(results, args.output / "index.txt")
+    write_download_index(results, args.index)
 
 
 def main() -> None:
@@ -437,21 +515,31 @@ def main() -> None:
     if not args.skip_download:
         download_pages(args)
         print(f"Каталог выгрузки: {args.output.resolve()}")
-        print(f"Файл индекса: {args.index.resolve()}")
+        print(f"Файл индекса URL: {args.index.resolve()}")
 
     page_files = iter_page_files(args.output)
     if not page_files:
         raise FileNotFoundError(f"В каталоге {args.output} нет HTML-файлов для обработки.")
 
-    tokens, lemma_to_tokens = collect_tokens_and_lemmas(args.output)
+    tokens, lemma_to_tokens, inverted_index, document_urls = collect_corpus_data(args.output)
     write_tokens(tokens, args.tokens)
     write_lemmas(lemma_to_tokens, args.lemmas)
+    write_inverted_index(inverted_index, args.inverted_index)
 
     print(f"Обработано HTML-файлов: {len(page_files)}")
     print(f"Токенов: {len(tokens)}")
     print(f"Лемм: {len(lemma_to_tokens)}")
+    print(f"Терминов в инвертированном индексе: {len(inverted_index)}")
     print(f"Файл токенов: {args.tokens.resolve()}")
     print(f"Файл лемм: {args.lemmas.resolve()}")
+    print(f"Файл инвертированного индекса: {args.inverted_index.resolve()}")
+
+    if args.query:
+        results = run_boolean_search(args.query, inverted_index, document_urls)
+        print(f"Запрос: {args.query}")
+        print(f"Найдено документов: {len(results)}")
+        for document_name, url in results:
+            print(f"{document_name}\t{url}")
 
 
 if __name__ == "__main__":
