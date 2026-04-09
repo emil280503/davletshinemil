@@ -1,24 +1,38 @@
 # PythonProject2
 
-Краулер на Python для скачивания HTML-страниц из заранее подготовленного списка URL.
+Скрипт для скачивания русскоязычных HTML-страниц, извлечения из них чистых токенов и группировки токенов по леммам.
 
-## Что в репозитории
+## Что делает
 
-- `main.py` - скачивает страницы из `urls.txt`;
-- `urls.txt` - список русскоязычных HTML-страниц;
-- `downloaded_pages/` - выгруженные страницы `001.html` ... `100.html`;
-- `index.txt` - соответствие `номер файла -> ссылка`;
-- `pages_archive.zip` - архив с выгрузкой.
+- скачивает не менее 100 HTML-страниц из `urls.txt`;
+- сохраняет страницы в `downloaded_pages/`;
+- строит `index.txt` со связкой `файл -> URL`;
+- извлекает видимый текст из HTML без `script/style/noscript`;
+- формирует `tokens.txt` без дублей, чисел, служебных слов и мусорных фрагментов;
+- формирует `lemmas.txt` в формате `лемма токен1 токен2 ...`.
+
+## Зависимости
+
+```bash
+python -m pip install -r requirements.txt
+```
 
 ## Запуск
 
+Полный цикл:
+
 ```bash
-python main.py --urls urls.txt --output downloaded_pages --index index.txt
+python main.py --urls urls.txt --output downloaded_pages --index index.txt --tokens tokens.txt --lemmas lemmas.txt
 ```
 
-## Требования задания
+Только обработка уже сохраненных документов:
 
-- страницы берутся из заранее подготовленного списка;
-- все страницы текстовые и одного языка;
-- HTML сохраняется без очистки разметки;
-- формируется `index.txt`.
+```bash
+python main.py --skip-download --output downloaded_pages --tokens tokens.txt --lemmas lemmas.txt
+```
+
+## Результат
+
+- `tokens.txt` - по одному токену на строку;
+- `lemmas.txt` - по одной лемме на строку, затем все относящиеся к ней токены;
+- `index.txt` - соответствие сохраненных страниц исходным URL.
