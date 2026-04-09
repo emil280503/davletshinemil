@@ -205,7 +205,7 @@ class VisibleTextExtractor(HTMLParser):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Скачивает HTML-страницы, строит индекс, выполняет булев поиск и считает TF-IDF."
+        description="Скачивает HTML-страницы, строит индекс, считает TF-IDF и выполняет булев и векторный поиск."
     )
     parser.add_argument("--urls", type=pathlib.Path, default=DEFAULT_URLS_FILE)
     parser.add_argument("--output", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
@@ -220,6 +220,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--query", type=str, help="Булев запрос с операторами AND, OR, NOT и круглыми скобками.")
+    parser.add_argument("--vector-query", type=str, help="Строка запроса для векторного поиска по TF-IDF.")
+    parser.add_argument("--top-k", type=int, default=10, help="Сколько лучших документов вернуть в векторном поиске.")
     return parser.parse_args()
 
 
@@ -463,17 +465,15 @@ def write_document_tfidf(
     reset_output_dir(lemma_output_dir)
 
     for document in document_stats:
-        if document.total_terms == 0:
-            term_lines: list[str] = []
-            lemma_lines: list[str] = []
-        else:
-            term_lines = []
+        term_lines: list[str] = []
+        lemma_lines: list[str] = []
+
+        if document.total_terms > 0:
             for term in sorted(document.term_counts):
                 tf = document.term_counts[term] / document.total_terms
                 idf = term_idf[term]
                 term_lines.append(f"{term} {idf:.6f} {tf * idf:.6f}")
 
-            lemma_lines = []
             for lemma in sorted(document.lemma_counts):
                 tf = document.lemma_counts[lemma] / document.total_terms
                 idf = lemma_idf[lemma]
@@ -487,6 +487,75 @@ def write_document_tfidf(
             "\n".join(lemma_lines) + ("\n" if lemma_lines else ""),
             encoding="utf-8",
         )
+
+
+def build_lemma_document_vectors(
+    document_stats: list[DocumentStats],
+    lemma_idf: dict[str, float],
+) -> dict[str, dict[str, float]]:
+    vectors: dict[str, dict[str, float]] = {}
+    for document in document_stats:
+        vector: dict[str, float] = {}
+        if document.total_terms > 0:
+            for lemma, count in document.lemma_counts.items():
+                tf = count / document.total_terms
+                vector[lemma] = tf * lemma_idf[lemma]
+        vectors[document.name] = vector
+    return vectors
+
+
+def build_query_vector(query: str, lemma_idf: dict[str, float]) -> dict[str, float]:
+    lemma_counts: Counter[str] = Counter()
+    for raw_token in TOKEN_PATTERN.findall(query.lower()):
+        lemma = normalize_term(raw_token)
+        if lemma is not None and lemma in lemma_idf:
+            lemma_counts[lemma] += 1
+
+    total_terms = sum(lemma_counts.values())
+    if total_terms == 0:
+        return {}
+
+    return {
+        lemma: (count / total_terms) * lemma_idf[lemma]
+        for lemma, count in lemma_counts.items()
+    }
+
+
+def vector_norm(vector: dict[str, float]) -> float:
+    return math.sqrt(sum(weight * weight for weight in vector.values()))
+
+
+def cosine_similarity(left: dict[str, float], right: dict[str, float]) -> float:
+    if not left or not right:
+        return 0.0
+
+    left_norm = vector_norm(left)
+    right_norm = vector_norm(right)
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+
+    shared_terms = set(left) & set(right)
+    dot_product = sum(left[term] * right[term] for term in shared_terms)
+    return dot_product / (left_norm * right_norm)
+
+
+def run_vector_search(
+    query: str,
+    document_vectors: dict[str, dict[str, float]],
+    lemma_idf: dict[str, float],
+    document_urls: dict[str, str],
+    top_k: int,
+) -> list[tuple[str, str, float]]:
+    query_vector = build_query_vector(query, lemma_idf)
+    scored_documents: list[tuple[str, str, float]] = []
+
+    for document_name, document_vector in document_vectors.items():
+        score = cosine_similarity(query_vector, document_vector)
+        if score > 0.0:
+            scored_documents.append((document_name, document_urls.get(document_name, ""), score))
+
+    scored_documents.sort(key=lambda item: (-item[2], item[0]))
+    return scored_documents[:top_k]
 
 
 def tokenize_query(query: str) -> list[str]:
@@ -654,10 +723,24 @@ def main() -> None:
 
     if args.query:
         results = run_boolean_search(args.query, inverted_index, document_urls)
-        print(f"Запрос: {args.query}")
+        print(f"Булев запрос: {args.query}")
         print(f"Найдено документов: {len(results)}")
         for document_name, url in results:
             print(f"{document_name}\t{url}")
+
+    if args.vector_query:
+        document_vectors = build_lemma_document_vectors(document_stats, lemma_idf)
+        results = run_vector_search(
+            query=args.vector_query,
+            document_vectors=document_vectors,
+            lemma_idf=lemma_idf,
+            document_urls=document_urls,
+            top_k=max(args.top_k, 1),
+        )
+        print(f"Векторный запрос: {args.vector_query}")
+        print(f"Найдено документов: {len(results)}")
+        for document_name, url, score in results:
+            print(f"{score:.6f}\t{document_name}\t{url}")
 
 
 if __name__ == "__main__":
