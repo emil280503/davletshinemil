@@ -22,6 +22,8 @@ DEFAULT_OUTPUT_DIR = pathlib.Path("downloaded_pages")
 DEFAULT_INDEX_FILE = pathlib.Path("index.txt")
 DEFAULT_TOKENS_FILE = pathlib.Path("tokens.txt")
 DEFAULT_LEMMAS_FILE = pathlib.Path("lemmas.txt")
+DEFAULT_DOCUMENT_TOKENS_DIR = pathlib.Path("document_tokens")
+DEFAULT_DOCUMENT_LEMMAS_DIR = pathlib.Path("document_lemmas")
 DEFAULT_INVERTED_INDEX_FILE = pathlib.Path("inverted_index.txt")
 DEFAULT_TERM_TFIDF_DIR = pathlib.Path("term_tfidf")
 DEFAULT_LEMMA_TFIDF_DIR = pathlib.Path("lemma_tfidf")
@@ -175,6 +177,7 @@ class DocumentStats:
     name: str
     term_counts: Counter[str]
     lemma_counts: Counter[str]
+    lemma_to_tokens: dict[str, set[str]]
     total_terms: int
 
 
@@ -212,6 +215,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index", type=pathlib.Path, default=DEFAULT_INDEX_FILE)
     parser.add_argument("--tokens", type=pathlib.Path, default=DEFAULT_TOKENS_FILE)
     parser.add_argument("--lemmas", type=pathlib.Path, default=DEFAULT_LEMMAS_FILE)
+    parser.add_argument("--document-tokens-dir", type=pathlib.Path, default=DEFAULT_DOCUMENT_TOKENS_DIR)
+    parser.add_argument("--document-lemmas-dir", type=pathlib.Path, default=DEFAULT_DOCUMENT_LEMMAS_DIR)
     parser.add_argument("--inverted-index", type=pathlib.Path, default=DEFAULT_INVERTED_INDEX_FILE)
     parser.add_argument("--term-tfidf-dir", type=pathlib.Path, default=DEFAULT_TERM_TFIDF_DIR)
     parser.add_argument("--lemma-tfidf-dir", type=pathlib.Path, default=DEFAULT_LEMMA_TFIDF_DIR)
@@ -375,6 +380,7 @@ def collect_corpus_data(
         visible_text = extract_visible_text(page_path.read_text(encoding="utf-8"))
         term_counts: Counter[str] = Counter()
         lemma_counts: Counter[str] = Counter()
+        lemma_to_tokens_in_document: dict[str, set[str]] = {}
 
         for raw_token in TOKEN_PATTERN.findall(visible_text.lower()):
             lemma = normalize_term(raw_token)
@@ -385,6 +391,7 @@ def collect_corpus_data(
             lemma_to_tokens.setdefault(lemma, set()).add(raw_token)
             term_counts[raw_token] += 1
             lemma_counts[lemma] += 1
+            lemma_to_tokens_in_document.setdefault(lemma, set()).add(raw_token)
 
         total_terms = sum(term_counts.values())
         document_stats.append(
@@ -392,6 +399,7 @@ def collect_corpus_data(
                 name=document_name,
                 term_counts=term_counts,
                 lemma_counts=lemma_counts,
+                lemma_to_tokens=lemma_to_tokens_in_document,
                 total_terms=total_terms,
             )
         )
@@ -484,6 +492,32 @@ def write_document_tfidf(
             encoding="utf-8",
         )
         (lemma_output_dir / f"{pathlib.Path(document.name).stem}.txt").write_text(
+            "\n".join(lemma_lines) + ("\n" if lemma_lines else ""),
+            encoding="utf-8",
+        )
+
+
+def write_document_tokens_and_lemmas(
+    document_stats: list[DocumentStats],
+    tokens_output_dir: pathlib.Path,
+    lemmas_output_dir: pathlib.Path,
+) -> None:
+    reset_output_dir(tokens_output_dir)
+    reset_output_dir(lemmas_output_dir)
+
+    for document in document_stats:
+        sorted_tokens = sorted(document.term_counts)
+        token_lines = sorted_tokens
+        lemma_lines = [
+            f"{lemma} {' '.join(sorted(tokens))}"
+            for lemma, tokens in sorted(document.lemma_to_tokens.items(), key=lambda item: item[0])
+        ]
+
+        (tokens_output_dir / f"{pathlib.Path(document.name).stem}.txt").write_text(
+            "\n".join(token_lines) + ("\n" if token_lines else ""),
+            encoding="utf-8",
+        )
+        (lemmas_output_dir / f"{pathlib.Path(document.name).stem}.txt").write_text(
             "\n".join(lemma_lines) + ("\n" if lemma_lines else ""),
             encoding="utf-8",
         )
@@ -702,6 +736,11 @@ def main() -> None:
 
     write_tokens(tokens, args.tokens)
     write_lemmas(lemma_to_tokens, args.lemmas)
+    write_document_tokens_and_lemmas(
+        document_stats=document_stats,
+        tokens_output_dir=args.document_tokens_dir,
+        lemmas_output_dir=args.document_lemmas_dir,
+    )
     write_inverted_index(inverted_index, args.inverted_index)
     write_document_tfidf(
         document_stats=document_stats,
@@ -717,6 +756,8 @@ def main() -> None:
     print(f"Терминов в инвертированном индексе: {len(inverted_index)}")
     print(f"Файл токенов: {args.tokens.resolve()}")
     print(f"Файл лемм: {args.lemmas.resolve()}")
+    print(f"Каталог токенов по документам: {args.document_tokens_dir.resolve()}")
+    print(f"Каталог лемм по документам: {args.document_lemmas_dir.resolve()}")
     print(f"Файл инвертированного индекса: {args.inverted_index.resolve()}")
     print(f"Каталог TF-IDF по терминам: {args.term_tfidf_dir.resolve()}")
     print(f"Каталог TF-IDF по леммам: {args.lemma_tfidf_dir.resolve()}")
